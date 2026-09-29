@@ -2,7 +2,7 @@ package ru.itmo.graphdb.storage;
 
 import ru.itmo.graphdb.model.Edge;
 import ru.itmo.graphdb.model.Node;
-import ru.itmo.graphdb.model.Metric;
+import ru.itmo.graphdb.model.DefaultMetric;
 import java.util.Collection;
 
 /**
@@ -53,5 +53,5 @@ public interface GraphStorage {
      * @param metric выбранная метрика для сортировки (DISTANCE, TIME или COST)
      * @return коллекция смежных ребер
      */
-    Collection<Edge> getSortedEdgesFrom(Node node,  Metric metric);
+    Collection<Edge> getSortedEdgesFrom(Node node,  DefaultMetric metric);
 }

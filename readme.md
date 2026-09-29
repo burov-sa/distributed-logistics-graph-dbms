@@ -60,9 +60,11 @@ distributed-logistics-graph-dbms/
     │           ├── client/ 
     │           │   └── GraphDBClient.java          # API-клиент для агентов AnyLogic
     │           ├── model/     
+    │           │   ├── CustomMetric.java           # Дополнительные полььзовательские метрики рёберы
+    │           │   ├── DefaultMetric.java          # Метрики рёбер по умолчанию для транспортной логистики (DISTANCE, TIME, COST)
     │           │   ├── Edge.java                   # Сущность ребра (маршрута)
-    │           │   ├── Label.java                  # Тип логистического объекта (SORTING_CENTRE, WAREHOUSE, ORDER_PICKUP_POINT)
     │           │   ├── Metric.java                 # Метрика рёбер (DISTANCE, TIME, COST)
+    │           │   ├── MetricRegistry.java         # Регистр используемых меток рёбер
     │           │   └── Node.java                   # Сущность вершины (логистический объект)
     │           ├── storage/      
     │           │   ├── GraphStorage.java           # Базовый интерфейс хранилища

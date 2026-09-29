@@ -11,12 +11,10 @@ import java.util.concurrent.ConcurrentHashMap;
 @Getter
 public class Node {
     private final String id;
-    private final Label label;
     private final Map<String, Object> attributes = new ConcurrentHashMap<>();
 
-    public Node(String id, Label label) {
+    public Node(String id) {
         this.id = id;
-        this.label = label;
     }
 
     /**

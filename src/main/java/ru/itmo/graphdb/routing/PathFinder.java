@@ -1,7 +1,7 @@
 package ru.itmo.graphdb.routing;
 
 import ru.itmo.graphdb.model.Edge;
-import ru.itmo.graphdb.model.Metric;
+import ru.itmo.graphdb.model.DefaultMetric;
 import ru.itmo.graphdb.storage.GraphStorage;
 import java.util.List;
 
@@ -18,5 +18,5 @@ public interface PathFinder {
      * @param metric критерий оптимизации (цена, время, расстояние)
      * @return упорядоченный список ребер, составляющих маршрут
      */
-    List<Edge> findShortestPath(GraphStorage storage, String source, String destination, Metric metric);
+    List<Edge> findShortestPath(GraphStorage storage, String source, String destination, DefaultMetric metric);
 }
