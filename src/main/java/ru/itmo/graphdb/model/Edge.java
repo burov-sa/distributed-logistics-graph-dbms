@@ -31,7 +31,7 @@ public class Edge {
     private final Map<String, Double> weights;
 
     /**
-     * Адпатированный под транспортную логистику конструктор для случая, когда на ребре есть ровно три дефолтных веса.
+     * Адаптированный под транспортную логистику конструктор для случая, когда на ребре есть ровно три дефолтных веса.
      * Использует ключи из {@link DefaultMetric}.
      */
     public Edge(String id, Node source, Node destination,
