@@ -1,6 +1,9 @@
 package ru.itmo.graphdb.network;
 
-import ru.itmo.graphdb.client.CommandTranslator;
+import ru.itmo.graphdb.client.CommandExecutor;
+import ru.itmo.graphdb.network.protocol.Frame;
+import ru.itmo.graphdb.network.protocol.Frames;
+import ru.itmo.graphdb.network.protocol.FrameType;
 
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
@@ -9,31 +12,74 @@ import java.io.IOException;
 import java.net.Socket;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
+import java.util.Objects;
+import java.util.function.Consumer;
 
 /**
  * Обслуживает одно TCP-соединение.
  *
- * <p>Протокол: один кадр {@code readUTF} → {@code translator.execute()} → один кадр
- * {@code writeUTF}. Соединение долгоживущее, запросы идут строго по одному.
+ * <p>Протокол: кадры {@link ru.itmo.graphdb.network.protocol.Frame}
+ * ({@code [type][UTF payload]}). Клиент присылает {@code REQ}, сервер отвечает
+ * {@code RESP}. Сервер в любой момент сеанса может отправить {@code PUSH}
+ * — клиент обязан его корректно принять и не спутать с ответом.
  *
- * <p>Каждое соединение получает свой {@link CommandTranslator}, чтобы
- * {@code currentDbName} не «протекал» между клиентами. При этом {@code GraphStorage},
- * {@code MetricRegistry} и {@code PathFinder} шарятся — это состояние всей ноды.
+ * <p>Соединение долгоживущее, в полёте всегда ровно один {@code REQ} на клиента
+ * (это гарантирует {@code GraphDBClient.execute} через {@code synchronized}).
+ *
+ * <p>Каждое соединение получает свой {@link CommandExecutor}, чтобы состояние
+ * сессии (например, {@code currentDbName} в {@code CommandTranslator}) не
+ * «протекало» между клиентами. Общее состояние ноды
+ * ({@code GraphStorage}, {@code MetricRegistry}, {@code PathFinder}) шарятся
+ * через фабрику исполнителей.
+ *
+ * <p>Жизненный цикл: {@code onConnect.accept(this)} вызывается один раз после
+ * инициализации потоков и до входа в read-loop — это окно для серверной
+ * инициализации соединения (например, push {@code SHARD_MAP} на Router).
+ * После выхода из {@code run()} сокет закрывается, ссылка на выходной поток
+ * обнуляется, а хэндлер удаляется из реестра сервером.
  */
 public class ClientHandler implements Runnable {
 
     /**
-     * Idle-таймаут: если клиент молчит 30 минут, закрываем соединение. Сделал для того, чтобы
-     * возможно мёртвый клиент не занимал поток пула бесконечно.
+     * Idle-таймаут: если клиент молчит 30 минут, закрываем соединение.
+     * Нужен, чтобы «мёртвый» клиент не занимал поток пула бесконечно.
      */
     private static final int IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 
     private final Socket socket;
-    private final CommandTranslator translator;
+    private final CommandExecutor commandExecutor;
+    private final Consumer<ClientHandler> onConnect;
 
-    public ClientHandler(Socket socket, CommandTranslator translator) {
-        this.socket = socket;
-        this.translator = translator;
+    /**
+     * Выходной поток. Инициализируется в {@link #run()} до вызова {@code onConnect},
+     * обнуляется в {@code finally} после выхода из цикла — под {@link #writeLock}.
+     * Может быть {@code null}, если {@link #sendPush(String)} пришёл до инициализации
+     * или после завершения — в этом случае push молча отбрасывается.
+     */
+    private DataOutputStream out;
+
+    /**
+     * Сериализует запись кадров в сокет между:
+     * <ul>
+     *   <li>потоком-обработчиком, пишущим {@code RESP};</li>
+     *   <li>любым потоком, вызывающим {@link #sendPush(String)} (обычно
+     *       {@code DBServer.broadcastPush}).</li>
+     * </ul>
+     * Без лока байты двух кадров могли бы перемешаться на проводе.
+     */
+    private final Object writeLock = new Object();
+
+    /** Старый конструктор без onConnect — сохранён для обратной совместимости. */
+    public ClientHandler(Socket socket, CommandExecutor commandExecutor) {
+        this(socket, commandExecutor, null);
+    }
+
+    public ClientHandler(Socket socket,
+                         CommandExecutor commandExecutor,
+                         Consumer<ClientHandler> onConnect) {
+        this.socket = Objects.requireNonNull(socket, "socket");
+        this.commandExecutor = Objects.requireNonNull(commandExecutor, "commandExecutor");
+        this.onConnect = onConnect;
     }
 
     @Override
@@ -41,41 +87,98 @@ public class ClientHandler implements Runnable {
         String remote = String.valueOf(socket.getRemoteSocketAddress());
 
         try (Socket s = socket) {
-            // Установка таймаута на чтение. Без него readUTF() будет висеть, пока клиент
-            // физически не закроет соединение, что может и не случится.
+            // Без таймаута read-кадр будет висеть, пока клиент физически не закроет
+            // соединение, что может и не случиться.
             s.setSoTimeout(IDLE_TIMEOUT_MS);
 
             DataInputStream in = new DataInputStream(s.getInputStream());
-            DataOutputStream out = new DataOutputStream(s.getOutputStream());
+            DataOutputStream outStream = new DataOutputStream(s.getOutputStream());
+
+            // out выставляем до onConnect, чтобы callback мог отправлять push.
+            synchronized (writeLock) {
+                this.out = outStream;
+            }
 
             System.out.println("[server] client connected: " + remote);
 
-            while (true) {
-                String line;
+            if (onConnect != null) {
                 try {
-                    line = in.readUTF();
+                    onConnect.accept(this);
+                } catch (RuntimeException e) {
+                    // callback — инфраструктурный; его падение не должно рвать сеанс.
+                    System.err.println("[server] onConnect callback failed for "
+                            + remote + ": " + e.getMessage());
+                }
+            }
+
+            while (true) {
+                Frame frame;
+                try {
+                    frame = Frames.read(in);
                 } catch (EOFException e) {
-                    // нормальное закрытие клиентом
                     System.out.println("[server] client disconnected: " + remote);
                     return;
                 } catch (SocketTimeoutException e) {
                     System.out.println("[server] idle timeout: " + remote);
                     return;
                 } catch (SocketException e) {
-                    // например, сервер делает stop() и закрывает сокет
+                    // Сюда же попадает server.stop(): сокет закрывают извне.
                     System.out.println("[server] socket closed: " + remote);
                     return;
                 }
 
-                // CommandTranslator.execute() никогда не бросает, упаковывает
-                // ошибку в "ERROR: ...".
-                String response = translator.execute(line);
+                if (frame.type() != FrameType.REQ) {
+                    // По протоколу клиент шлёт только REQ. Иное — либо ошибка
+                    // клиента, либо мусор после реконнекта. Игнорируем, не падая.
+                    System.err.println("[server] unexpected frame type from "
+                            + remote + ": " + frame.type());
+                    continue;
+                }
 
-                out.writeUTF(response);
-                out.flush();
+                // CommandExecutor.execute никогда не бросает, упаковывает
+                // ошибку в "ERROR: ...".
+                String response = commandExecutor.execute(frame.payload());
+
+                synchronized (writeLock) {
+                    if (this.out != null) {
+                        Frames.write(this.out, Frame.response(response));
+                        this.out.flush();
+                    }
+                }
             }
         } catch (IOException e) {
             System.out.println("[server] I/O error with " + remote + ": " + e.getMessage());
+        } finally {
+            synchronized (writeLock) {
+                this.out = null;
+            }
         }
     }
+
+    /**
+     * Отправляет клиенту асинхронное push-уведомление.
+     *
+     * <p>Может вызываться из любого потока. Если соединение ещё не
+     * инициализировано или уже закрыто, либо запись упала — сообщение
+     * молча отбрасывается (DBServer удалит хэндлер из реестра по завершении
+     * {@link #run()}).
+     */
+    public void sendPush(String message) {
+        if (message == null) {
+            return;
+        }
+        synchronized (writeLock) {
+            if (out == null) {
+                return;
+            }
+            try {
+                Frames.write(out, Frame.push(message));
+                out.flush();
+            } catch (IOException ignored) {
+                // Соединение отвалилось; зарегистрированный обработчик
+                // удалится из реестра по завершении run().
+            }
+        }
+    }
+
 }

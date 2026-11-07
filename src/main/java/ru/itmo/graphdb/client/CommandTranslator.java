@@ -22,7 +22,7 @@ import java.util.stream.Collectors;
  *
  * <p>Поддерживаемые команды — см. «Словарь команд графовой СУБД».
  */
-public class CommandTranslator {
+public class CommandTranslator implements CommandExecutor {
 
     private final GraphStorage storage;
     private final MetricRegistry metrics;

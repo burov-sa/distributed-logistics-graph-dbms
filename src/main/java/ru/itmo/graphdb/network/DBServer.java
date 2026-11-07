@@ -1,6 +1,6 @@
 package ru.itmo.graphdb.network;
 
-import lombok.AccessLevel;
+import ru.itmo.graphdb.client.CommandExecutor;
 import ru.itmo.graphdb.client.CommandTranslator;
 import ru.itmo.graphdb.model.MetricRegistry;
 import ru.itmo.graphdb.routing.PathFinder;
@@ -13,55 +13,106 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-
+import java.util.function.Consumer;
 
 /**
  * TCP-сервер графовой ноды.
  *
  * <p>Жизненный цикл: {@link #start(int)} → accept-loop → обработчики в пуле →
- * {@link #stop()}. Состояние всей ноды ({@link GraphStorage}, {@link MetricRegistry},
- * {@link PathFinder}) создаётся снаружи и шарится между соединениями.
+ * {@link #stop()}. Исполнители команд создаются фабрикой
+ * {@link CommandExecutorFactory} — по одному на соединение. Общее состояние
+ * ноды (хранилище, реестр метрик, pathfinder) контролирует фабрика
+ * (обычно — замыкание с общими ссылками).
+ *
+ * <p>Двунаправленность: помимо ответов на запросы сервер умеет асинхронно
+ * пушить сообщения всем живым клиентам через {@link #broadcastPush(String)},
+ * а на этапе подключения — вызывать пользовательский callback
+ * {@code setOnClientConnected(Consumer)} (например, чтобы отправить
+ * {@code SHARD_MAP} на Router-слое).
  */
 public class DBServer {
 
-    /** Пул под обработчики соединений (фиксированный, чтобы один клиент с сотней
-     *  открытых сокетов не положил сервер). */
+    /**
+     * Пул под обработчики соединений. Фиксированный, чтобы один клиент
+     * с сотней открытых сокетов не положил сервер.
+     */
     private static final int CLIENT_POOL_SIZE = 8;
 
-    private final GraphStorage storage;
-    private final MetricRegistry metrics;
-    private final PathFinder pathFinder;
+    private final CommandExecutorFactory executorFactory;
 
-    private final ExecutorService clientPool = Executors.newFixedThreadPool(CLIENT_POOL_SIZE);
+    private final ExecutorService clientPool =
+            Executors.newFixedThreadPool(CLIENT_POOL_SIZE);
 
     /**
-     * Трекинг активных клиентских сокетов.
-     * Нужен, чтобы {@link #stop()} мог их принудительно закрыть — иначе
-     * {@code readUTF} в обработчиках зависнет на 30 минут idle-таймаута,
-     * и JVM не завершится (потоки пула не daemon).
+     * Трекинг активных клиентских сокетов — нужен, чтобы {@link #stop()}
+     * мог их принудительно закрыть. Иначе {@code read} в обработчиках
+     * зависнет на 30-минутном idle-таймауте, и JVM не завершится
+     * (потоки пула не daemon).
      */
     private final Set<Socket> activeClients = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Трекинг активных {@link ClientHandler} — нужен для {@link #broadcastPush(String)}.
+     * Хэндлер попадает сюда в onConnect и удаляется по завершении {@code run()}.
+     */
+    private final Set<ClientHandler> activeHandlers = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Пользовательский callback на подключение клиента. Может быть {@code null}.
+     * Устанавливается до {@link #start(int)}; читается из accept-потока.
+     */
+    private volatile Consumer<ClientHandler> onClientConnected;
 
     private volatile boolean running = false;
     private ServerSocket serverSocket;
     private Thread acceptThread;
     private int port = -1;
 
+    /**
+     * Обратно совместимый конструктор: общее состояние ноды передаётся
+     * напрямую, фабрика строит per-connection {@link CommandTranslator}
+     * поверх этих же ссылок. Используется текущим {@link #main(String[])}
+     * и существующими тестами.
+     */
     public DBServer(GraphStorage storage, MetricRegistry metrics, PathFinder pathFinder) {
-        this.storage = storage;
-        this.metrics = metrics;
-        this.pathFinder = pathFinder;
+        Objects.requireNonNull(storage, "storage");
+        Objects.requireNonNull(metrics, "metrics");
+        Objects.requireNonNull(pathFinder, "pathFinder");
+        this.executorFactory = () -> new CommandTranslator(storage, metrics, pathFinder);
+    }
+
+    /**
+     * Конструктор с фабрикой: даёт полный контроль над тем, какой
+     * {@link CommandExecutor} получит каждое соединение (например, для
+     * Router-слоя или read-only режима на Slave).
+     */
+    public DBServer(CommandExecutorFactory executorFactory) {
+        this.executorFactory = Objects.requireNonNull(executorFactory, "executorFactory");
+    }
+
+    /**
+     * Регистрирует пользовательский callback, вызываемый один раз на каждое
+     * успешно установленное соединение, до входа в read-loop. Внутри callback
+     * можно, например, отправить клиенту push с топологией шардов.
+     *
+     * <p>Callback не должен бросать наружу — исключения логируются и
+     * игнорируются.
+     */
+    public void setOnClientConnected(Consumer<ClientHandler> callback) {
+        this.onClientConnected = callback;
     }
 
     /**
      * Запускает сервер. Возвращает управление сразу после открытия сокета.
-     * {@code port = 0} - ОС выберет свободный порт, фактический даст {@link #getPort()}.
+     * {@code port = 0} — ОС выберет свободный порт, фактический даст
+     * {@link #getPort()}.
      */
     public synchronized void start(int port) throws IOException {
         if (running) {
@@ -87,24 +138,29 @@ public class DBServer {
      * Идемпотентен.
      */
     public synchronized void stop() {
-        if (!running) return;
+        if (!running) {
+            return;
+        }
         running = false;
 
         // 1) Закрываем ServerSocket — это разбудит accept() с SocketException.
         try {
             serverSocket.close();
         } catch (IOException ignored) {
+            // ignore
         }
 
-        // 2) Закрываем все активные клиентские сокеты — это разбудит readUTF()
-        //    с SocketException. Без этого обработчики будут висеть до idle-таймаута.
+        // 2) Закрываем все активные клиентские сокеты — это разбудит чтение
+        //    кадра в обработчиках. Без этого они будут висеть до idle-таймаута.
         for (Socket s : activeClients) {
             try {
                 s.close();
             } catch (IOException ignored) {
+                // ignore
             }
         }
         activeClients.clear();
+        activeHandlers.clear();
 
         // 3) Гасим пул и ждём.
         clientPool.shutdownNow();
@@ -135,6 +191,31 @@ public class DBServer {
         return running;
     }
 
+    /**
+     * Отправляет push-сообщение всем активным клиентам.
+     *
+     * <p>Каждый {@link ClientHandler} сериализует запись через свой
+     * {@code writeLock}, поэтому одновременный {@code broadcastPush} из
+     * нескольких потоков не перемешает байты. Медленный клиент может
+     * задержать остальных — для MVP приемлемо; в проде понадобился бы
+     * per-client исходящий буфер и отдельный sender-поток.
+     *
+     * @param message текстовая нагрузка (не {@code null}); {@code null} игнорируется
+     */
+    public void broadcastPush(String message) {
+        if (message == null) {
+            return;
+        }
+        for (ClientHandler handler : activeHandlers) {
+            handler.sendPush(message);
+        }
+    }
+
+    /** Текущее число подключённых клиентов — для health-check / метрик. */
+    public int getActiveClientCount() {
+        return activeHandlers.size();
+    }
+
     // ---- внутреннее ----
 
     private void acceptLoop() {
@@ -143,23 +224,43 @@ public class DBServer {
                 Socket client = serverSocket.accept();
                 activeClients.add(client);
 
-                // Свой транслятор на соединение: изолирует currentDbName.
-                CommandTranslator perConnTranslator =
-                        new CommandTranslator(storage, metrics, pathFinder);
+                CommandExecutor executor = executorFactory.createForConnection();
 
                 clientPool.submit(() -> {
+                    ClientHandler handler = new ClientHandler(
+                            client,
+                            executor,
+                            registered -> {
+                                activeHandlers.add(registered);
+                                Consumer<ClientHandler> userCallback = onClientConnected;
+                                if (userCallback != null) {
+                                    try {
+                                        userCallback.accept(registered);
+                                    } catch (RuntimeException e) {
+                                        System.err.println(
+                                                "[server] onClientConnected callback failed: "
+                                                        + e.getMessage());
+                                    }
+                                }
+                            }
+                    );
                     try {
-                        new ClientHandler(client, perConnTranslator).run();
+                        handler.run();
                     } finally {
+                        activeHandlers.remove(handler);
                         activeClients.remove(client);
                     }
                 });
             } catch (SocketException e) {
-                // serverSocket.close() во время stop() — это штатно
-                if (!running) break;
+                // serverSocket.close() во время stop() — это штатно.
+                if (!running) {
+                    break;
+                }
                 System.err.println("[server] accept socket error: " + e.getMessage());
             } catch (IOException e) {
-                if (!running) break;
+                if (!running) {
+                    break;
+                }
                 System.err.println("[server] accept I/O error: " + e.getMessage());
             }
         }
@@ -174,10 +275,14 @@ public class DBServer {
             }
         }
 
+        GraphStorage storage = new InMemoryGraphStorage();
+        MetricRegistry metrics = new MetricRegistry();
+        PathFinder pathFinder = new SimpleDijkstraPathFinder();
+
+        // Фабрика замыкает общее состояние ноды и создаёт per-connection
+        // CommandTranslator с изолированным currentDbName.
         DBServer server = new DBServer(
-                new InMemoryGraphStorage(),
-                new MetricRegistry(),
-                new SimpleDijkstraPathFinder()
+                () -> new CommandTranslator(storage, metrics, pathFinder)
         );
         server.start(port);
 
