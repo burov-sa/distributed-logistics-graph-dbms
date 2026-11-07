@@ -4,10 +4,7 @@ import ru.itmo.graphdb.network.protocol.Frame;
 import ru.itmo.graphdb.network.protocol.FrameType;
 import ru.itmo.graphdb.network.protocol.Frames;
 
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
-import java.io.EOFException;
-import java.io.IOException;
+import java.io.*;
 import java.net.ConnectException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
@@ -109,9 +106,19 @@ public class GraphDBClient implements AutoCloseable {
         s.connect(new InetSocketAddress(host, port), connectTimeoutMs);
         s.setSoTimeout(readTimeoutMs);
 
+        // КРИТИЧНО для request-response протокола:
+        // отключаем алгоритм Нейгла. Иначе writeByte(type) + writeUTF(payload)
+        // (3 маленьких сисколла на кадр) задерживаются на ~40 мс из-за
+        // Nagle + Delayed ACK. При сотнях/тысячах round-trip'ов (PATH_EDGE
+        // через шард-границы) это даёт десятки секунд.
+        s.setTcpNoDelay(true);
+
         this.socket = s;
-        this.in = new DataInputStream(s.getInputStream());
-        this.out = new DataOutputStream(s.getOutputStream());
+        // Буферизуем потоки: writeByte + writeUTF идут в буфер, flush()
+        // отправляет один TCP-сегмент. В паре с TCP_NODELAY убирает
+        // фрагментацию кадра на проводе.
+        this.in = new DataInputStream(new BufferedInputStream(s.getInputStream()));
+        this.out = new DataOutputStream(new BufferedOutputStream(s.getOutputStream()));
     }
 
     public synchronized boolean isConnected() {

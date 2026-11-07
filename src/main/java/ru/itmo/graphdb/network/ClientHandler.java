@@ -5,6 +5,8 @@ import ru.itmo.graphdb.network.protocol.Frame;
 import ru.itmo.graphdb.network.protocol.Frames;
 import ru.itmo.graphdb.network.protocol.FrameType;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.EOFException;
@@ -91,8 +93,20 @@ public class ClientHandler implements Runnable {
             // соединение, что может и не случиться.
             s.setSoTimeout(IDLE_TIMEOUT_MS);
 
-            DataInputStream in = new DataInputStream(s.getInputStream());
-            DataOutputStream outStream = new DataOutputStream(s.getOutputStream());
+            // КРИТИЧНО для request-response протокола:
+            // отключаем алгоритм Нейгла. Иначе writeByte(type) + writeUTF(payload)
+            // (3 маленьких сисколла на кадр) задерживаются на ~40 мс из-за
+            // Nagle + Delayed ACK. При шардированном PATH_EDGE с десятком
+            // round-trip'ов на запрос это критично.
+            s.setTcpNoDelay(true);
+
+            // Буферизация: writeByte + writeUTF идут в память, flush() отдаёт
+            // кадр одним TCP-сегментом. В паре с TCP_NODELAY убирает
+            // фрагментацию кадра и лишние сисколлы.
+            DataInputStream in = new DataInputStream(
+                    new BufferedInputStream(s.getInputStream()));
+            DataOutputStream outStream = new DataOutputStream(
+                    new BufferedOutputStream(s.getOutputStream()));
 
             // out выставляем до onConnect, чтобы callback мог отправлять push.
             synchronized (writeLock) {
@@ -180,5 +194,4 @@ public class ClientHandler implements Runnable {
             }
         }
     }
-
 }
