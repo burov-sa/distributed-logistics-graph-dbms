@@ -94,6 +94,8 @@ public class ShardCommandTranslator implements CommandExecutor {
         try {
             String trimmed = line.trim();
             if (trimmed.startsWith("_")) {
+                // TODO: Для демо: видно каждый внутренний запрос, пришедший от Router'а.
+                System.out.println("[shard-" + shardId + "] " + trimmed);
                 return executeInternal(trimmed);
             }
             return delegate.execute(line);

@@ -184,7 +184,10 @@ distributed-logistics-graph-dbms/
 
 Правила раскладки (реализованы в `ShardRouter`):
 
-* **Узел `X` живёт на шарде `h(X) = floorMod(hashCode(X), N)`.**
+* **Узел `X` живёт на шарде `h(X)`** — результат consistent hashing
+  (FNV-1a 64-bit + кольцо из `ShardRouter.DEFAULT_VIRTUAL_NODES_PER_SHARD`
+  виртуальных узлов на каждый шард). При добавлении/удалении шарда
+  переезжает только ~`1/(N+1)` ключей.
 * **Ребро `A → B` живёт на шарде своего source `h(A)`** — рядом с вершиной,
   из которой оно исходит (adjacency list).
 
@@ -207,10 +210,8 @@ distributed-logistics-graph-dbms/
 
 Ограничения:
 * `hashCode % N` — при добавлении/удалении шарда все ключи переезжают.
-  Consistent hashing и rebalancing — future work.
 * Топология фиксирована на старте Router. Broadcast нового `SHARD_MAP` уже
-  подключённым клиентам (`DBServer.broadcastPush`) — инфраструктура готова,
-  политика — future work.
+  подключённым клиентам (`DBServer.broadcastPush`) — инфраструктура готова для этапа 5.
 
 ### 6.3. Протокол (двунаправленный сокет)
 
@@ -348,8 +349,8 @@ Push'и, пришедшие до установки листенера, буфе
 
 | Ограничение | Причина | Путь улучшения |
 |---|---|---|
-| `hashCode % N` | Простота; детерминированность | Consistent hashing, range-based sharding |
-| Топология фиксирована на старте | Не реализована политика rebalance | Инфраструктура broadcast нового `SHARD_MAP` готова |
+| `hashCode % N` | ~~Простота~~ **заменено на consistent hashing** | — (сделано) |
+| Топология фиксирована на старте | Не реализована политика rebalance при изменении ring | Broadcast нового `SHARD_MAP` подключённым клиентам; consistent hashing уже даёт минимальное движение |
 | `ShardedGraphStorage` шарит `GraphDBClient` на шард | `execute()` — `synchronized` | Per-connection пул клиентов на шард |
 | `PATH_EDGE` делает O(K) round-trip'ов | Нет кэша промежуточных `getEdgesFrom` | `CachingGraphStorage`-декоратор на время запроса |
 | Клиент может подключиться к шарду напрямую | Шард не отделяет клиентский порт от router-порта | Отдельный порт для `_`-команд, firewall / auth |
@@ -395,7 +396,17 @@ Push'и, пришедшие до установки листенера, буфе
 * `ShardedClusterLifecycleIntegrationTest` — `SAVE_DB` создаёт по файлу
   на шард, `CREATE_DB` очищает всё, `READ_DB` восстанавливает кросс-шардовый
   путь с обоими весами; `READ_DB` несуществующего → `ERROR:`.
-
+* `ShardRouterTest` — детерминированность `h(id)`, распределение по шардам,
+  wire-формат `SHARD_MAP`, валидация `shardId`/`port`, round-trip через
+  `asText`/`fromText`. Плюс проверки consistent hashing:
+  * `shardForNode` возвращает **shardId**, а не индекс в списке (важно
+    для ненулевых shardId);
+  * размер кольца = `shards × vnodes`;
+  * при 4 шардах и 10 000 ключей каждый шард получает 15-35% (ожидаемо ~25%);
+  * при 200 vnodes на шард — 20-30% (тугая балансировка);
+  * при добавлении 4-го шарда переезжает ~25% ключей (15-35%);
+  * при удалении 3-го шарда переезжает ~33% ключей (20-45%).
+  
 ### 6.10. Запуск кластера
 
 ```bash
